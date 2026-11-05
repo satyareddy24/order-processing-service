@@ -1,0 +1,159 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Order processing service - accept now, process later.
+
+Globals:
+  Function:
+    Timeout: 30
+    Runtime: python3.12
+    MemorySize: 256
+
+Resources:
+  IntakeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/intake/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref OrdersQueue
+          ORDERS_TABLE: !Ref OrdersTable
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt OrdersQueue.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+      Events:
+        PlaceOrder:
+          Type: Api
+          Properties:
+            Path: /orders
+            Method: post
+        GetOrder:
+          Type: Api
+          Properties:
+            Path: /orders/{id}
+            Method: get
+
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrdersDLQ.Arn
+        maxReceiveCount: 3
+
+  OrdersDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+
+  InventoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: sku
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sku
+          KeyType: HASH
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/worker/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          INVENTORY_TABLE: !Ref InventoryTable
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt OrdersQueue.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref InventoryTable
+      Events:
+        ProcessOrders:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrdersQueue.Arn
+            BatchSize: 5
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            
+  DLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Fires when any message lands in the dead-letter queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OrdersDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+
+  WorkerErrorAlarm:
+   Type: AWS::CloudWatch::Alarm
+   Properties:
+     AlarmDescription: Fires when the worker function errors.
+     Namespace: AWS/Lambda
+     MetricName: Errors
+     Dimensions:
+       - Name: FunctionName
+         Value: !Ref WorkerFunction
+     Statistic: Sum
+     Period: 300
+     EvaluationPeriods: 1
+     Threshold: 1
+     ComparisonOperator: GreaterThanOrEqualToThreshold
+
+  QueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Fires when a message waits in the queue longer than 5 minutes.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OrdersQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 300
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL for placing orders
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/orders"
+  OrdersQueueUrl:
+    Description: URL of the orders SQS queue
+    Value: !Ref OrdersQueue
+  OrdersTableName:
+    Description: Name of the orders DynamoDB table
+    Value: !Ref OrdersTable
+  InventoryTableName:
+    Description: Name of the inventory DynamoDB table
+    Value: !Ref InventoryTable
+
+
+
+
